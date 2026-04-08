@@ -1,171 +1,132 @@
-import os
-import json
-from openai import OpenAI
-from env.email_env import EmailTriageEnv
-from env.models import EmailTriageAction
+from .models import EmailTriageAction
+from .sla import sla_multiplier
 
-# Mandatory Variables - The validator injects API_BASE_URL and API_KEY
-# We prioritize these, then fall back to your local environment names
-FINAL_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
-FINAL_API_KEY = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN") or os.environ.get("OPENAI_API_KEY")
-MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+# Constants for scoring
+VALID_CATEGORIES = {"urgent", "spam", "newsletter", "info", "action_required"}
+VALID_PRIORITIES = {"high", "medium", "low"}
 
-# Verification: Ensure we actually have a key before initializing
-if not FINAL_API_KEY:
-    raise ValueError("No API Key found. Please set API_KEY or HF_TOKEN environment variable.")
-
-client = OpenAI(base_url=FINAL_BASE_URL, api_key=FINAL_API_KEY)
-
-SYSTEM_PROMPT = """You are an expert email triage assistant for a corporate workplace inbox.
-
-Given an email (and thread history if available), respond with ONLY a valid JSON object — no explanation, no markdown, no extra text.
-
-JSON format:
-{
-  "action_type": "categorize | reply | escalate | archive | delete | flag",
-  "category": "urgent | spam | newsletter | info | action_required",
-  "priority": "high | medium | low",
-  "reply_text": "your reply here if action_required or urgent, else null",
-  "needs_escalation": true or false
+# Partial credit for "close" misclassifications
+CATEGORY_PARTIAL_CREDIT = {
+    ("urgent", "action_required"): 0.6,
+    ("action_required", "urgent"): 0.6,
+    ("newsletter", "info"): 0.4,
+    ("info", "newsletter"): 0.4,
+    ("spam", "info"): 0.1,
 }
 
-Rules:
-- urgent = production issues, legal threats, security breaches, payment fraud, angry enterprise customers
-- action_required = needs a response or decision but not emergency (leave requests, invoice approvals, meeting requests)
-- spam = promotional, phishing, prize scams, crypto schemes, fake job offers
-- newsletter = digest emails, product updates, weekly roundups
-- info = FYI emails, notifications, resolved incidents, welcome emails
-- high priority = SLA < 2 hours or serious business impact
-- medium priority = needs response within 24-48 hours
-- low priority = no time pressure
-- needs_escalation = true ONLY for urgent + high_priority emails
-- reply_text = write a professional reply ONLY for urgent or action_required, else null
-- For Hindi+English emails: understand both languages and triage correctly"""
+def grade_action(email_data: dict, action: EmailTriageAction, task_name: str, step_number: int) -> tuple:
+    labels = email_data.get("labels", [])
+    sla_minutes = email_data.get("sla_minutes", None)
+    breakdown = {}
 
+    # 1. Determine ground truth from data
+    correct_category = _get_correct_category(labels)
+    correct_priority = _get_correct_priority(labels)
 
-def get_llm_action(obs) -> EmailTriageAction:
-    """Call the LLM to decide action for current email."""
-
-    # Build context string
-    thread_str = ""
-    if obs.thread_context:
-        thread_str = "\n\nTHREAD HISTORY (oldest first):\n"
-        for msg in obs.thread_context:
-            thread_str += f"From: {msg.get('from', msg.get('sender',''))}\n"
-            thread_str += f"Message: {msg.get('body', '')}\n---\n"
-
-    bilingual_note = ""
-    if obs.is_bilingual:
-        bilingual_note = "\n[Note: This email contains Hindi+English mixed language content]"
-
-    user_prompt = f"""Triage this email:
-
-From: {obs.sender}
-Subject: {obs.subject}
-Body: {obs.body}{thread_str}{bilingual_note}
-
-Inbox remaining: {obs.inbox_remaining}
-Step: {obs.step_number}
-
-Respond with ONLY the JSON object."""
-
-    try:
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt}
-            ],
-            max_tokens=300,
-            temperature=0.1,  # low temp for consistent triage decisions
-        )
-        raw = response.choices[0].message.content.strip()
-
-        # Clean up if model wraps in markdown
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        raw = raw.strip()
-
-        data = json.loads(raw)
-
-        return EmailTriageAction(
-            action_type=data.get("action_type", "categorize"),
-            category=data.get("category", "info"),
-            priority=data.get("priority", "low"),
-            reply_text=data.get("reply_text", None),
-            needs_escalation=bool(data.get("needs_escalation", False))
-        )
-
-    except Exception as e:
-        # Fallback if LLM fails or returns bad JSON
-        print(f"[DEBUG] LLM error: {e}", flush=True)
-        return EmailTriageAction(
-            action_type="categorize",
-            category="info",
-            priority="low",
-            reply_text=None,
-            needs_escalation=False
-        )
-
-
-def run_task(task_name: str, max_steps: int) -> float:
-    """Run one full task episode and return final score."""
-
-    env = EmailTriageEnv(task_name=task_name)
-    obs = env.reset()
-
-    rewards = []
-    steps_taken = 0
-    done = False
-
-    print(f"[START] task={task_name} env=email-triage model={MODEL_NAME}", flush=True)
-
-    for step in range(1, max_steps + 1):
-        if done:
-            break
-
-        # LLM decides the action
-        action = get_llm_action(obs)
-
-        # Step the environment
-        obs, reward_obj, done, info = env.step(action)
-        current_reward = float(reward_obj.value)
-        rewards.append(current_reward)
-        steps_taken = step
-
-        print(
-            f"[STEP] step={step} action={action.action_type} "
-            f"reward={current_reward:.2f} done={str(done).lower()} error=null",
-            flush=True
-        )
-
-    score = sum(rewards) / len(rewards) if rewards else 0.0
+    # 2. Category Scoring (Logic Consistency)
+    if action.category == correct_category:
+        cat_score = 0.99  # Nudged from 1.0
+    else:
+        cat_score = CATEGORY_PARTIAL_CREDIT.get((action.category, correct_category), 0.01)
     
-    # --- CHANGE: Clamp strictly between (0, 1) ---
-    score = round(min(max(score, 0.001), 0.999), 3)
-    
-    success = score >= 0.5
-    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    # Penalty: If user labels as SPAM but tries to REPLY
+    if action.category == "spam" and action.action_type == "reply":
+        cat_score *= 0.2
 
-    print(
-        f"[END] success={str(success).lower()} steps={steps_taken} "
-        f"score={score:.3f} rewards={rewards_str}",
-        flush=True
+    breakdown["category"] = cat_score
+
+    # 3. Priority Scoring
+    if action.priority == correct_priority:
+        breakdown["priority"] = 0.99  # Nudged from 1.0
+    elif _adjacent_priority(action.priority, correct_priority):
+        breakdown["priority"] = 0.5
+    else:
+        breakdown["priority"] = 0.01
+
+    # 4. Reply Quality
+    breakdown["reply"] = _grade_reply_sophisticated(labels, action)
+
+    # 5. Escalation Management
+    breakdown["escalation"] = _grade_escalation(labels, action)
+
+    # 6. Task-Specific Weighting
+    if task_name == "basic_triage":
+        score = breakdown["category"]
+    elif task_name == "priority_routing":
+        score = (0.5 * breakdown["category"]) + (0.5 * breakdown["priority"])
+    else:  # full_inbox_management
+        score = (
+            0.30 * breakdown["category"] +
+            0.20 * breakdown["priority"] +
+            0.35 * breakdown["reply"] +
+            0.15 * breakdown["escalation"]
+        )
+
+    # 7. Apply SLA Decay
+    sla_mult = sla_multiplier(sla_minutes, step_number)
+    score *= sla_mult
+    breakdown["sla_multiplier"] = sla_mult
+
+    # 8. Destructive Action Guardrail
+    if "urgent" in labels and action.action_type in ["delete", "archive"] and cat_score < 0.99:
+        score *= 0.1 
+
+    reason = (
+        f"Cat:{breakdown['category']:.2f} | Pri:{breakdown['priority']:.1f} | "
+        f"Reply:{breakdown['reply']:.2f} | SLA:{sla_mult:.2f}"
     )
+    
+    # Final Clamp strictly between 0.001 and 0.999
+    final_score = round(min(max(score, 0.001), 0.999), 3)
+    
+    return final_score, breakdown, reason
 
-    return score
+
+def _get_correct_category(labels):
+    if "spam" in labels: return "spam"
+    if "urgent" in labels: return "urgent"
+    if "action_required" in labels: return "action_required"
+    if "newsletter" in labels: return "newsletter"
+    return "info"
 
 
-if __name__ == "__main__":
-    # Run all 3 tasks as required by the spec
-    results = {}
+def _get_correct_priority(labels):
+    if "high_priority" in labels: return "high"
+    if "medium_priority" in labels: return "medium"
+    return "low"
 
-    results["basic_triage"] = run_task("basic_triage", max_steps=5)
-    results["priority_routing"] = run_task("priority_routing", max_steps=10)
-    results["full_inbox_management"] = run_task("full_inbox_management", max_steps=90)
 
-    print("\n[SUMMARY]", flush=True)
-    for task, score in results.items():
-        print(f"  {task}: {score:.3f}", flush=True)
+def _adjacent_priority(given, correct):
+    adj = [("high", "medium"), ("medium", "high"), ("medium", "low"), ("low", "medium")]
+    return (given, correct) in adj
+
+
+def _grade_reply_sophisticated(labels, action):
+    needs_reply = any(l in labels for l in ["action_required", "urgent"])
+    
+    if not needs_reply:
+        return 0.99 if not action.reply_text else 0.5
+
+    if not action.reply_text or len(action.reply_text.strip()) < 10:
+        return 0.01
+
+    text = action.reply_text.lower()
+    professional_tokens = ["sincerely", "thanks", "regards", "best", "confirm", "meeting", "scheduled"]
+    token_hits = sum(1 for t in professional_tokens if t in text)
+    
+    length_bonus = min(len(text) / 200, 1.0)
+    tone_score = min(token_hits / 2, 1.0)
+    
+    reply_val = (0.4 * length_bonus) + (0.6 * tone_score)
+    return round(min(max(reply_val, 0.01), 0.99), 2)
+
+
+def _grade_escalation(labels, action):
+    should_escalate = "urgent" in labels and "high_priority" in labels
+    
+    if should_escalate:
+        # Nudged boundaries
+        return 0.99 if action.needs_escalation else 0.01
+    else:
+        # Nudged boundaries
+        return 0.7 if action.needs_escalation else 0.99
