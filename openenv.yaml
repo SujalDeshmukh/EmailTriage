@@ -1,0 +1,10 @@
+version: "1.0.0"
+name: "email-triage-env"
+description: "Real-world email triage simulation for agent training."
+tasks:
+  - id: "basic_triage"
+    difficulty: "easy"
+  - id: "priority_routing"
+    difficulty: "medium"
+  - id: "full_inbox_management"
+    difficulty: "hard"

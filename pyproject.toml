@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "email-triage-env"
+version = "0.1.0"
+description = "A real-world email triage environment for AI agents"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.104.0",
+    "pydantic>=2.0.0",
+    "uvicorn>=0.24.0",
+    "openai>=1.0.0",
+    "openenv-core>=0.2.0"
+]
+
+[project.scripts]
+# This allows the command 'server' to run your FastAPI app
+server = "server.app:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+# This ensures both your logic (env) and your API (server) are packaged
+include = ["env*", "server*"]
