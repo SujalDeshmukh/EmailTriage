@@ -16,8 +16,6 @@ if not FINAL_API_KEY:
 
 client = OpenAI(base_url=FINAL_BASE_URL, api_key=FINAL_API_KEY)
 
-# Rest of your code (SYSTEM_PROMPT, get_llm_action, etc.) follows...
-
 SYSTEM_PROMPT = """You are an expert email triage assistant for a corporate workplace inbox.
 
 Given an email (and thread history if available), respond with ONLY a valid JSON object — no explanation, no markdown, no extra text.
@@ -144,7 +142,10 @@ def run_task(task_name: str, max_steps: int) -> float:
         )
 
     score = sum(rewards) / len(rewards) if rewards else 0.0
-    score = round(min(max(score, 0.0), 1.0), 3)
+    
+    # --- CHANGE: Clamp strictly between (0, 1) ---
+    score = round(min(max(score, 0.001), 0.999), 3)
+    
     success = score >= 0.5
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
 
